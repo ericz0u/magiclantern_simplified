@@ -8,6 +8,12 @@
  *
  * The sticker is an 8-bit BMP using the camera's palette, with index 0 as
  * transparent; make it with make_cropmark.py --sticker --height 288.
+ *
+ * Canon swaps parts of the palette between screens, so the sticker only uses
+ * entries that stay put, plus its own colors in CUSTOM_FIRST..CUSTOM_LAST
+ * (unused by Canon and ML). Their RGB comes from the BMP's palette table and
+ * gets programmed into the camera's palette on every tick, since Canon
+ * reloads the palette when it switches screens.
  */
 
 #include <module.h>
@@ -31,6 +37,10 @@
 #define TICK_MS 100         /* how often overwritten pixels get repainted */
 #define SETTLE_MS 150       /* give Canon a moment to draw the new screen */
 
+/* palette entries the sticker may define itself */
+#define CUSTOM_FIRST 0x1A
+#define CUSTOM_LAST  0x25
+
 extern int get_gui_mode();
 extern int display_is_on();
 
@@ -38,6 +48,11 @@ static CONFIG_INT("plush.enabled", plush_enabled, 1);
 
 static struct bmp_file_t * sticker = 0;
 static int sticker_stride;
+
+/* camera palette values (opacity, Y, U, V) for the custom entries the sticker uses */
+static uint32_t custom_palette[CUSTOM_LAST + 1];
+static uint8_t custom_used[CUSTOM_LAST + 1];
+static int custom_palette_applied = 0;
 
 /* current placement; cur_w == 0 means nothing on screen */
 static int cur_x, cur_y, cur_w, cur_h;
@@ -61,6 +76,53 @@ static int rand_range(int lo, int hi)
 {
     if (hi <= lo) return lo;
     return lo + rng() % (hi - lo + 1);
+}
+
+/* BMP palette RGB -> camera palette entry; inverse of yuv2rgb in src/imgconv.c */
+static uint32_t rgb_to_palette_entry(int r, int g, int b, int opacity)
+{
+    int y = (218 * r + 732 * g + 74 * b) >> 10;
+    int u = COERCE((b - y) * 1024 / 1900, -127, 127);
+    int v = COERCE((r - y) * 1024 / 1608, -127, 127);
+    return ((opacity & 0xFF) << 24) | ((y & 0xFF) << 16) | ((u & 0xFF) << 8) | (v & 0xFF);
+}
+
+/* read the sticker's own colors from its BMP palette table (BGRA after the header) */
+static void load_custom_palette(int * used)
+{
+    /* same opacity as Canon's opaque white */
+    int opacity = (LCD_Palette[3 * COLOR_WHITE + 2] >> 24) & 0xFF;
+    uint8_t * bgra = (uint8_t *) sticker + 14 + sticker->hdr_size;
+
+    for (int i = CUSTOM_FIRST; i <= CUSTOM_LAST; i++)
+    {
+        if (!used[i]) continue;
+        uint8_t * c = bgra + 4 * i;
+        custom_palette[i] = rgb_to_palette_entry(c[2], c[1], c[0], opacity);
+        custom_used[i] = 1;
+    }
+}
+
+static void apply_custom_palette()
+{
+    for (int i = CUSTOM_FIRST; i <= CUSTOM_LAST; i++)
+    {
+        if (!custom_used[i]) continue;
+        EngDrvOut(LCD_Palette[3 * i], custom_palette[i]);
+        EngDrvOut(LCD_Palette[3 * i + 0x300], custom_palette[i]);
+    }
+    custom_palette_applied = 1;
+}
+
+static void restore_custom_palette()
+{
+    for (int i = CUSTOM_FIRST; i <= CUSTOM_LAST; i++)
+    {
+        if (!custom_used[i]) continue;
+        EngDrvOut(LCD_Palette[3 * i], LCD_Palette[3 * i + 2]);
+        EngDrvOut(LCD_Palette[3 * i + 0x300], LCD_Palette[3 * i + 2]);
+    }
+    custom_palette_applied = 0;
 }
 
 /* changes whenever Canon or ML switches to a different screen */
@@ -179,9 +241,12 @@ static void plush_task()
         if (!plush_enabled || !display_is_on())
         {
             if (cur_w) BMP_LOCK( erase_sticker(); )
+            if (custom_palette_applied && display_is_on()) restore_custom_palette();
             prev_sig = 0;
             continue;
         }
+
+        apply_custom_palette();
 
         int sig = screen_signature();
         if (sig != prev_sig || reshuffle || !cur_w)
@@ -268,6 +333,16 @@ static unsigned int plush_init()
     sticker = bmp;
     sticker_stride = (sticker->width + 3) & ~3;
     rng_state = get_ms_clock() | 1;
+
+    int used[256] = {0};
+    for (int y = 0; y < sticker->height; y++)
+    {
+        for (int x = 0; x < (int)sticker->width; x++)
+        {
+            used[sticker->image[y * sticker_stride + x]] = 1;
+        }
+    }
+    load_custom_palette(used);
 
     task_create("plush_task", 0x1e, 0x1000, plush_task, 0);
     return 0;

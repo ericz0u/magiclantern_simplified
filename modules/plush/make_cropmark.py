@@ -10,15 +10,20 @@ Then copy PLUSH.BMP to ML/CROPMKS/ on the SD card and pick it under
 Overlay -> Crop marks.
 
 How ML reads these files (see src/bmp.c and src/cropmarks.c):
-  * The pixel values are indexes into the camera's fixed bitmap palette, so the
-    image is snapped to the colors in ML_PALETTE below.
+  * The pixel values are indexes into the camera's bitmap palette, so the
+    image is snapped to colors from ML_PALETTE below.
   * Index 0 is fully transparent.
-  * Only indexes below 0x80 are usable: the crop mark cache uses bit 7 as a flag.
-  * 0x03 and 0x14..0x25 are left out: they are transparent black/gray or get
-    rewritten at runtime.
+  * Canon swaps parts of the palette between screens (in LiveView, the skin and
+    red entries from 0x50 up turn bluish), so only STABLE entries are used:
+    white, black, ML's named colors and its gray ramp. 0x03/0x14 are transparent
+    and 0x04 is ML's invisible zebra grid, so those are skipped too.
   * Uncompressed 8-bit files are fine; ML converts them to RLE8 when loading.
   * File names must end in .BMP and fit in 14 characters, and ML lists at most
     9 crop marks.
+
+With --sticker, the image also gets its own colors in CUSTOM_SLOTS (0x1A..0x25,
+unused by Canon and ML). Their RGB goes in the BMP's palette table, and the
+plush module programs them into the camera's palette after every screen change.
 """
 
 import argparse
@@ -56,21 +61,32 @@ ML_PALETTE = [
 ]
 
 TRANSPARENT = 0
-SKIP = {0x00, 0x03} | set(range(0x14, 0x26))
-USABLE = [i for i in range(len(ML_PALETTE)) if i not in SKIP]
+# magentas 0x0E and 0x10 are left out too; they only add pink specks
+STABLE = [0x01, 0x02] + [i for i in range(0x05, 0x14) if i not in (0x0E, 0x10)] + list(range(0x26, 0x50))
+CUSTOM_SLOTS = list(range(0x1A, 0x26))
 
 
-def to_ml_indexes(img, dither):
-    """Snap an RGB image to the usable ML colors; returns a list of ML indexes."""
+def pick_custom_colors(sticker):
+    """The image's own main colors, one per custom slot."""
+    opaque = [rgba[:3] for rgba in sticker.getdata() if rgba[3] >= 128]
+    strip = Image.new("RGB", (len(opaque), 1))
+    strip.putdata(opaque)
+    q = strip.quantize(colors=len(CUSTOM_SLOTS), method=Image.Quantize.MEDIANCUT)
+    pal = q.getpalette()[:3 * len(CUSTOM_SLOTS)]
+    return [tuple(pal[i:i + 3]) for i in range(0, len(pal), 3)]
+
+
+def to_ml_indexes(img, palette, usable, dither):
+    """Snap an RGB image to the usable palette entries; returns a list of ML indexes."""
     # Pillow quantizes against a 256-entry palette, so pad the usable colors
     # with copies of the first one; ties resolve to the earlier entry.
-    compact = [ML_PALETTE[i] for i in USABLE]
+    compact = [palette[i] for i in usable]
     compact += [compact[0]] * (256 - len(compact))
     pal_img = Image.new("P", (1, 1))
     pal_img.putpalette([c for rgb in compact for c in rgb])
     mode = Image.Dither.FLOYDSTEINBERG if dither else Image.Dither.NONE
     q = img.quantize(palette=pal_img, dither=mode)
-    lut = [USABLE[i] if i < len(USABLE) else USABLE[0] for i in range(256)]
+    lut = [usable[i] if i < len(usable) else usable[0] for i in range(256)]
     return [lut[p] for p in q.getdata()]
 
 
@@ -103,11 +119,19 @@ def main():
         x0 = (W - w) // 2 if args.x is None else args.x
         y0 = (H - h) // 2 if args.y is None else args.y
 
-    indexes = to_ml_indexes(sticker.convert("RGB"), dither=not args.no_dither)
+    palette = list(ML_PALETTE)
+    usable = list(STABLE)
+    if args.sticker:
+        # crop marks can't set the palette, only the module can
+        for slot, rgb in zip(CUSTOM_SLOTS, pick_custom_colors(sticker)):
+            palette[slot] = rgb
+            usable.append(slot)
+
+    indexes = to_ml_indexes(sticker.convert("RGB"), palette, usable, dither=not args.no_dither)
     alpha = sticker.getchannel("A").getdata()
 
     canvas = Image.new("P", (cw, ch), TRANSPARENT)
-    canvas.putpalette([c for rgb in ML_PALETTE for c in rgb] + [0] * 3 * (256 - len(ML_PALETTE)))
+    canvas.putpalette([c for rgb in palette for c in rgb] + [0] * 3 * (256 - len(palette)))
     for i, (idx, a) in enumerate(zip(indexes, alpha)):
         if a >= 128:
             x, y = x0 + i % w, y0 + i // w
