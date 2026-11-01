@@ -43,6 +43,8 @@
 
 extern int get_gui_mode();
 extern int display_is_on();
+extern int is_play_mode();
+extern int is_menu_mode();
 
 static CONFIG_INT("plush.enabled", plush_enabled, 1);
 
@@ -128,13 +130,18 @@ static void restore_custom_palette()
 /* changes whenever Canon or ML switches to a different screen */
 static int screen_signature()
 {
+    /* turning the mode dial (P/Tv/Av/...) keeps the same dialog, but the
+     * shooting screens show the mode, so count it there */
+    int shows_mode = !is_play_mode() && !is_menu_mode() && !gui_menu_shown();
+
     return (int)(intptr_t)get_current_dialog_handler()
          + get_gui_mode() * 1009
          + gui_state * 7919
          + lv * 104729
          + lv_dispsize * 1299709
          + gui_menu_shown() * 15485863
-         + display_is_on() * 32452843;
+         + display_is_on() * 32452843
+         + (shows_mode ? shooting_mode_custom * 49979687 : 0);
 }
 
 /* remove the sticker, but only where it is still on screen untouched;
